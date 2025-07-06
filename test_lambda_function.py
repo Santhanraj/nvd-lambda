@@ -8,6 +8,7 @@ import unittest
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch, MagicMock
 import pytest
+import requests_mock
 
 # Import the lambda function
 import lambda_function
@@ -295,6 +296,149 @@ class TestIntegration(unittest.TestCase):
         # Test upsert
         processed_count = lambda_function.upsert_to_supabase(mock_client, vulnerabilities)
         self.assertEqual(processed_count, 1)
+
+
+class TestCPEFunctionality(unittest.TestCase):
+    """Test cases for CPE data fetching functionality."""
+    
+    def setUp(self):
+        """Set up test fixtures for CPE tests."""
+        os.environ['SUPABASE_URL'] = 'https://test.supabase.co'
+        os.environ['SUPABASE_SERVICE_ROLE_KEY'] = 'test-key'
+        os.environ['NVD_API_KEY'] = 'test-nvd-key'
+    
+    def tearDown(self):
+        """Clean up after CPE tests."""
+        for key in ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'NVD_API_KEY']:
+            if key in os.environ:
+                del os.environ[key]
+    
+    @patch('lambda_function.requests.get')
+    def test_make_nvd_cpe_request_success(self, mock_get):
+        """Test successful NVD CPE API request."""
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {'products': []}
+        mock_get.return_value = mock_response
+        
+        headers = {'test': 'header'}
+        params = {'test': 'param'}
+        
+        response = lambda_function.make_nvd_cpe_request(headers, params)
+        
+        self.assertEqual(response, mock_response)
+        mock_get.assert_called_once_with(
+            lambda_function.CPE_BASE_URL,
+            headers=headers,
+            params=params,
+            timeout=30
+        )
+    
+    @patch('lambda_function.requests.get')
+    @patch('lambda_function.time.sleep')
+    def test_make_nvd_cpe_request_rate_limited(self, mock_sleep, mock_get):
+        """Test NVD CPE API request with rate limiting."""
+        # First call returns 429, second call succeeds
+        mock_response_429 = Mock()
+        mock_response_429.status_code = 429
+        
+        mock_response_200 = Mock()
+        mock_response_200.status_code = 200
+        mock_response_200.json.return_value = {'products': []}
+        
+        mock_get.side_effect = [mock_response_429, mock_response_200]
+        
+        headers = {'test': 'header'}
+        params = {'test': 'param'}
+        
+        response = lambda_function.make_nvd_cpe_request(headers, params)
+        
+        self.assertEqual(response, mock_response_200)
+        self.assertEqual(mock_get.call_count, 2)
+        mock_sleep.assert_called_once_with(lambda_function.RETRY_DELAY)
+    
+    @requests_mock.Mocker()
+    @patch('lambda_function.time.sleep')
+    def test_fetch_nvd_cpe_data(self, mock_sleep, m):
+        """Test fetching CPE data from NVD API."""
+        # Mock CPE API response
+        mock_cpe_response = {
+            'totalResults': 2,
+            'products': [
+                {
+                    'cpe': {
+                        'cpeName': 'cpe:2.3:a:apache:http_server:2.4.41:*:*:*:*:*:*:*',
+                        'cpeNameId': 'test-id-1',
+                        'lastModified': '2023-01-01T00:00:00.000'
+                    }
+                },
+                {
+                    'cpe': {
+                        'cpeName': 'cpe:2.3:a:microsoft:windows:10:*:*:*:*:*:*:*',
+                        'cpeNameId': 'test-id-2',
+                        'lastModified': '2023-01-02T00:00:00.000'
+                    }
+                }
+            ]
+        }
+        
+        m.get(lambda_function.CPE_BASE_URL, json=mock_cpe_response, status_code=200)
+        
+        start_date = datetime.utcnow() - timedelta(days=1)
+        end_date = datetime.utcnow()
+        
+        cpe_data = lambda_function.fetch_nvd_cpe_data(start_date, end_date, 'test-key')
+        
+        self.assertEqual(len(cpe_data), 2)
+        self.assertEqual(cpe_data[0]['cpe']['cpeName'], 'cpe:2.3:a:apache:http_server:2.4.41:*:*:*:*:*:*:*')
+        self.assertEqual(cpe_data[1]['cpe']['cpeName'], 'cpe:2.3:a:microsoft:windows:10:*:*:*:*:*:*:*')
+    
+    @requests_mock.Mocker()
+    @patch('lambda_function.time.sleep')
+    def test_fetch_nvd_cpe_data_pagination(self, mock_sleep, m):
+        """Test CPE data fetching with pagination."""
+        # First page response
+        first_page_response = {
+            'totalResults': 3000,
+            'products': [
+                {
+                    'cpe': {
+                        'cpeName': f'cpe:2.3:a:test:product{i}:1.0:*:*:*:*:*:*:*',
+                        'cpeNameId': f'test-id-{i}',
+                        'lastModified': '2023-01-01T00:00:00.000'
+                    }
+                } for i in range(2000)
+            ]
+        }
+        
+        # Second page response
+        second_page_response = {
+            'totalResults': 3000,
+            'products': [
+                {
+                    'cpe': {
+                        'cpeName': f'cpe:2.3:a:test:product{i}:1.0:*:*:*:*:*:*:*',
+                        'cpeNameId': f'test-id-{i}',
+                        'lastModified': '2023-01-01T00:00:00.000'
+                    }
+                } for i in range(2000, 3000)
+            ]
+        }
+        
+        # Register mock responses for pagination
+        m.get(lambda_function.CPE_BASE_URL, [
+            {'json': first_page_response, 'status_code': 200},
+            {'json': second_page_response, 'status_code': 200}
+        ])
+        
+        start_date = datetime.utcnow() - timedelta(days=30)
+        end_date = datetime.utcnow()
+        
+        cpe_data = lambda_function.fetch_nvd_cpe_data(start_date, end_date, 'test-key')
+        
+        self.assertEqual(len(cpe_data), 3000)
+        self.assertEqual(cpe_data[0]['cpe']['cpeNameId'], 'test-id-0')
+        self.assertEqual(cpe_data[-1]['cpe']['cpeNameId'], 'test-id-2999')
 
 
 if __name__ == '__main__':

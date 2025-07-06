@@ -285,5 +285,178 @@ class TestFunctionalScenarios(unittest.TestCase):
                 mock_table.upsert.reset_mock()
 
 
+class TestCPEFunctionalScenarios(unittest.TestCase):
+    """Functional test scenarios for CPE data fetching."""
+    
+    def setUp(self):
+        """Set up functional test fixtures for CPE tests."""
+        os.environ['SUPABASE_URL'] = 'https://test.supabase.co'
+        os.environ['SUPABASE_SERVICE_ROLE_KEY'] = 'test-key'
+        os.environ['NVD_API_KEY'] = 'test-nvd-key'
+        
+        self.mock_context = Mock()
+        self.mock_context.aws_request_id = 'test-request-id'
+    
+    def tearDown(self):
+        """Clean up after CPE functional tests."""
+        for key in ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'NVD_API_KEY']:
+            if key in os.environ:
+                del os.environ[key]
+    
+    @requests_mock.Mocker()
+    @patch('lambda_function.time.sleep')
+    def test_cpe_large_dataset_processing(self, mock_sleep, m):
+        """Test processing of large CPE dataset with pagination."""
+        cpe_base_url = lambda_function.CPE_BASE_URL
+        
+        # First page response
+        first_page_response = {
+            'totalResults': 3000,
+            'products': [
+                {
+                    'cpe': {
+                        'cpeName': f'cpe:2.3:a:vendor{i}:product{i}:1.0:*:*:*:*:*:*:*',
+                        'cpeNameId': f'cpe-id-{i:05d}',
+                        'lastModified': '2023-01-01T00:00:00.000',
+                        'created': '2023-01-01T00:00:00.000'
+                    }
+                } for i in range(2000)
+            ]
+        }
+        
+        # Second page response
+        second_page_response = {
+            'totalResults': 3000,
+            'products': [
+                {
+                    'cpe': {
+                        'cpeName': f'cpe:2.3:a:vendor{i}:product{i}:1.0:*:*:*:*:*:*:*',
+                        'cpeNameId': f'cpe-id-{i:05d}',
+                        'lastModified': '2023-01-01T00:00:00.000',
+                        'created': '2023-01-01T00:00:00.000'
+                    }
+                } for i in range(2000, 3000)
+            ]
+        }
+        
+        # Register mock responses
+        m.get(cpe_base_url, [
+            {'json': first_page_response, 'status_code': 200},
+            {'json': second_page_response, 'status_code': 200}
+        ])
+        
+        # Test processing
+        start_date = datetime.utcnow() - timedelta(days=30)
+        end_date = datetime.utcnow()
+        
+        cpe_data = lambda_function.fetch_nvd_cpe_data(
+            start_date, end_date, 'test-key'
+        )
+        
+        # Verify results
+        self.assertEqual(len(cpe_data), 3000)
+        self.assertEqual(cpe_data[0]['cpe']['cpeNameId'], 'cpe-id-00000')
+        self.assertEqual(cpe_data[-1]['cpe']['cpeNameId'], 'cpe-id-02999')
+    
+    @requests_mock.Mocker()
+    @patch('lambda_function.time.sleep')
+    def test_cpe_api_error_recovery(self, mock_sleep, m):
+        """Test recovery from CPE API errors."""
+        cpe_base_url = lambda_function.CPE_BASE_URL
+        
+        # Mock API responses: first fails, second succeeds
+        success_response = {
+            'totalResults': 1,
+            'products': [{
+                'cpe': {
+                    'cpeName': 'cpe:2.3:a:test:product:1.0:*:*:*:*:*:*:*',
+                    'cpeNameId': 'test-cpe-id',
+                    'lastModified': '2023-01-01T00:00:00.000',
+                    'created': '2023-01-01T00:00:00.000'
+                }
+            }]
+        }
+        
+        m.get(cpe_base_url, [
+            {'status_code': 500},  # First request fails
+            {'json': success_response, 'status_code': 200}  # Second succeeds
+        ])
+        
+        start_date = datetime.utcnow() - timedelta(days=1)
+        end_date = datetime.utcnow()
+        
+        cpe_data = lambda_function.fetch_nvd_cpe_data(
+            start_date, end_date, 'test-key'
+        )
+        
+        self.assertEqual(len(cpe_data), 1)
+        self.assertEqual(cpe_data[0]['cpe']['cpeNameId'], 'test-cpe-id')
+    
+    @requests_mock.Mocker()
+    @patch('lambda_function.create_client')
+    @patch('lambda_function.time.sleep')
+    def test_integrated_cve_and_cpe_processing(self, mock_sleep, mock_create_client, m):
+        """Test integrated processing of both CVE and CPE data."""
+        # Mock Supabase client
+        mock_client = Mock()
+        mock_table = Mock()
+        mock_upsert = Mock()
+        mock_execute = Mock()
+        
+        mock_client.table.return_value = mock_table
+        mock_table.upsert.return_value = mock_upsert
+        mock_upsert.execute.return_value = Mock()
+        mock_create_client.return_value = mock_client
+        
+        # Mock CVE API response
+        cve_response = {
+            'totalResults': 1,
+            'vulnerabilities': [{
+                'cve': {
+                    'id': 'CVE-2023-12345',
+                    'descriptions': [{
+                        'lang': 'en',
+                        'value': 'Test vulnerability'
+                    }],
+                    'published': '2023-01-01T00:00:00.000',
+                    'lastModified': '2023-01-02T00:00:00.000',
+                    'metrics': {
+                        'cvssMetricV31': [{
+                            'cvssData': {
+                                'baseScore': 7.5
+                            }
+                        }]
+                    }
+                }
+            }]
+        }
+        
+        # Mock CPE API response
+        cpe_response = {
+            'totalResults': 1,
+            'products': [{
+                'cpe': {
+                    'cpeName': 'cpe:2.3:a:test:product:1.0:*:*:*:*:*:*:*',
+                    'cpeNameId': 'test-cpe-id',
+                    'lastModified': '2023-01-01T00:00:00.000'
+                }
+            }]
+        }
+        
+        # Register mock responses
+        m.get(lambda_function.NVD_BASE_URL, json=cve_response, status_code=200)
+        m.get(lambda_function.CPE_BASE_URL, json=cpe_response, status_code=200)
+        
+        # Test the integration by calling lambda handler
+        event = {}
+        result = lambda_function.lambda_handler(event, self.mock_context)
+        
+        # Verify successful execution
+        self.assertEqual(result['statusCode'], 200)
+        response_body = json.loads(result['body'])
+        self.assertIn('processed_count', response_body)
+        self.assertEqual(response_body['processed_count'], 1)  # 1 vulnerability processed
+
+
 if __name__ == '__main__':
     unittest.main()

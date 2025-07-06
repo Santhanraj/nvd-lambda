@@ -23,6 +23,7 @@ logger.setLevel(logging.INFO)
 
 # Constants
 NVD_BASE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+CPE_BASE_URL = "https://services.nvd.nist.gov/rest/json/cpes/2.0"
 CHUNK_DAYS = 120
 BATCH_SIZE = 2000
 RATE_LIMIT_DELAY = 6  # seconds between requests (NVD allows 10 requests per minute)
@@ -71,7 +72,13 @@ def lambda_handler(event, context):
         for chunk_start, chunk_end in date_chunks:
             logger.info(f"Processing chunk: {chunk_start.date()} to {chunk_end.date()}")
             
+            # Fetch vulnerabilities
             vulnerabilities = fetch_nvd_vulnerabilities(
+                chunk_start, chunk_end, nvd_api_key
+            )
+            
+            # Fetch CPE data for the same time period
+            cpe_data = fetch_nvd_cpe_data(
                 chunk_start, chunk_end, nvd_api_key
             )
             
@@ -79,6 +86,9 @@ def lambda_handler(event, context):
                 processed_count = upsert_to_supabase(supabase_client, vulnerabilities)
                 total_processed += processed_count
                 logger.info(f"Processed {processed_count} vulnerabilities in this chunk")
+            
+            if cpe_data:
+                logger.info(f"Fetched {len(cpe_data)} CPE records in this chunk (not processed yet)")
             
             # Rate limiting between chunks
             time.sleep(RATE_LIMIT_DELAY)
@@ -343,6 +353,117 @@ def extract_cvss_score(metrics: Dict) -> Optional[float]:
         return cvss_v2[0].get('cvssData', {}).get('baseScore')
     
     return None
+
+
+def fetch_nvd_cpe_data(start_date: datetime, end_date: datetime, api_key: Optional[str]) -> List[Dict]:
+    """
+    Fetch CPE (Common Platform Enumeration) data from NVD API for the specified date range.
+    
+    Args:
+        start_date: Start date for CPE search
+        end_date: End date for CPE search
+        api_key: NVD API key (optional but recommended)
+        
+    Returns:
+        List[Dict]: List of raw CPE records (not processed yet)
+        
+    Raises:
+        NVDAPIError: If API request fails
+    """
+    cpe_records = []
+    start_index = 0
+    results_per_page = 2000  # NVD API maximum
+    
+    # Format dates for API
+    mod_start_date = start_date.strftime('%Y-%m-%dT%H:%M:%S.000')
+    mod_end_date = end_date.strftime('%Y-%m-%dT%H:%M:%S.000')
+    
+    headers = {
+        'User-Agent': 'AWS-Lambda-NVD-Sync/1.0',
+        'Accept': 'application/json'
+    }
+    
+    if api_key:
+        headers['apiKey'] = api_key
+        logger.info("Using API key for NVD CPE requests")
+    else:
+        logger.warning("No API key provided for CPE requests - requests will be rate limited")
+    
+    while True:
+        params = {
+            'lastModStartDate': mod_start_date,
+            'lastModEndDate': mod_end_date,
+            'startIndex': start_index,
+            'resultsPerPage': results_per_page
+        }
+        
+        try:
+            response = make_nvd_cpe_request(headers, params)
+            data = response.json()
+            
+            # Extract CPE records from response
+            if 'products' in data:
+                batch_cpe_records = data['products']
+                cpe_records.extend(batch_cpe_records)
+                
+                logger.info(f"Fetched {len(batch_cpe_records)} CPE records "
+                           f"(total: {len(cpe_records)})")
+            
+            # Check if we have more results
+            total_results = data.get('totalResults', 0)
+            if start_index + results_per_page >= total_results:
+                break
+                
+            start_index += results_per_page
+            
+            # Rate limiting between requests
+            time.sleep(RATE_LIMIT_DELAY)
+            
+        except Exception as e:
+            raise NVDAPIError(f"Failed to fetch NVD CPE data: {str(e)}")
+    
+    logger.info(f"Total CPE records fetched: {len(cpe_records)}")
+    return cpe_records
+
+
+def make_nvd_cpe_request(headers: Dict, params: Dict) -> requests.Response:
+    """
+    Make HTTP request to NVD CPE API with retry logic.
+    
+    Args:
+        headers: Request headers
+        params: Request parameters
+        
+    Returns:
+        requests.Response: API response
+        
+    Raises:
+        NVDAPIError: If all retry attempts fail
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.get(
+                CPE_BASE_URL,
+                headers=headers,
+                params=params,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                return response
+            elif response.status_code == 429:  # Rate limited
+                logger.warning(f"CPE API rate limited, waiting {RETRY_DELAY} seconds")
+                time.sleep(RETRY_DELAY)
+                continue
+            else:
+                response.raise_for_status()
+                
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"CPE request attempt {attempt + 1} failed: {str(e)}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+            else:
+                raise NVDAPIError(f"All CPE retry attempts failed: {str(e)}")
 
 
 def upsert_to_supabase(client: Client, vulnerabilities: List[Dict]) -> int:

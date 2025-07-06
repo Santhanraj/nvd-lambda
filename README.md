@@ -4,7 +4,9 @@ This AWS Lambda function fetches vulnerability data from the National Vulnerabil
 
 ## Features
 
-- **Comprehensive Data Fetching**: Retrieves vulnerabilities published in the last 365 days
+- **Comprehensive Data Fetching**: 
+  - Retrieves CVE vulnerabilities published in the last 365 days
+  - Fetches CPE (Common Platform Enumeration) data modified in the last 365 days
 - **Intelligent Chunking**: Processes data in 120-day chunks to comply with NVD API best practices
 - **Rate Limiting**: Implements proper rate limiting to respect NVD API limits
 - **Batch Processing**: Upserts data to Supabase in batches of 2000 records for optimal performance
@@ -18,6 +20,8 @@ This AWS Lambda function fetches vulnerability data from the National Vulnerabil
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
 │   AWS Lambda    │───▶│    NVD API      │    │   Supabase      │
 │   (Scheduler)   │    │                 │    │   Database      │
+│                 │    │  - CVE Data     │    │                 │
+│                 │    │  - CPE Data     │    │                 │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
          │                       │                       ▲
          │                       │                       │
@@ -206,9 +210,10 @@ The function logs structured information:
 ```python
 # Example log entries
 INFO: Starting NVD vulnerability data sync
-INFO: Fetching vulnerabilities from 2023-01-01 to 2023-12-31
+INFO: Fetching vulnerabilities and CPE data from 2023-01-01 to 2023-12-31
 INFO: Processing chunk: 2023-01-01 to 2023-05-01
 INFO: Fetched 1500 vulnerabilities (total: 1500)
+INFO: Fetched 800 CPE records in this chunk (not processed yet)
 INFO: Successfully upserted batch of 1500 records
 INFO: Successfully processed 15000 total vulnerabilities
 ```
@@ -288,11 +293,13 @@ chunks = lambda_function.generate_date_chunks(start_date, end_date, 120)
 print(f"Generated {len(chunks)} chunks")
 
 # Test CVSS extraction
-metrics = {
-    'cvssMetricV31': [{'cvssData': {'baseScore': 7.5}}]
-}
-score = lambda_function.extract_cvss_score(metrics)
-print(f"CVSS Score: {score}")
+from datetime import datetime, timedelta
+import lambda_function
+
+start_date = datetime.utcnow() - timedelta(days=1)
+end_date = datetime.utcnow()
+cpe_data = lambda_function.fetch_nvd_cpe_data(start_date, end_date, 'your-api-key')
+print(f"Fetched {len(cpe_data)} CPE records")
 ```
 
 ## Security Considerations
