@@ -83,7 +83,9 @@ def lambda_handler(event, context):
             )
             
             if vulnerabilities:
-                processed_count = upsert_to_supabase(supabase_client, vulnerabilities)
+                # Process vulnerabilities with CPE vendor lookup
+                processed_vulnerabilities = process_nvd_response(vulnerabilities, cpe_data)
+                processed_count = upsert_to_supabase(supabase_client, processed_vulnerabilities)
                 total_processed += processed_count
                 logger.info(f"Processed {processed_count} vulnerabilities in this chunk")
             
@@ -210,10 +212,10 @@ def fetch_nvd_vulnerabilities(start_date: datetime, end_date: datetime, api_key:
             
             # Extract vulnerabilities from response
             if 'vulnerabilities' in data:
-                batch_vulnerabilities = process_nvd_response(data['vulnerabilities'])
+                batch_vulnerabilities = data['vulnerabilities']
                 vulnerabilities.extend(batch_vulnerabilities)
                 
-                logger.info(f"Fetched {len(batch_vulnerabilities)} vulnerabilities "
+                logger.info(f"Fetched {len(batch_vulnerabilities)} raw vulnerabilities "
                            f"(total: {len(vulnerabilities)})")
             
             # Check if we have more results
@@ -273,16 +275,20 @@ def make_nvd_request(headers: Dict, params: Dict) -> requests.Response:
                 raise NVDAPIError(f"All retry attempts failed: {str(e)}")
 
 
-def process_nvd_response(vulnerabilities_data: List[Dict]) -> List[Dict]:
+def process_nvd_response(vulnerabilities_data: List[Dict], cpe_data: List[Dict] = None) -> List[Dict]:
     """
-    Process raw NVD API response and extract required fields.
+    Process raw NVD API response and extract required fields, including vendor lookup from CPE data.
     
     Args:
         vulnerabilities_data: Raw vulnerability data from NVD API
+        cpe_data: CPE data for vendor lookup (optional)
         
     Returns:
         List[Dict]: Processed vulnerability records
     """
+    # Build vendor lookup dictionary from CPE data
+    vendor_lookup = build_vendor_lookup(cpe_data) if cpe_data else {}
+    
     processed_vulnerabilities = []
     
     for vuln_data in vulnerabilities_data:
@@ -309,12 +315,16 @@ def process_nvd_response(vulnerabilities_data: List[Dict]) -> List[Dict]:
             # Extract CVSS score (prefer 3.1, fallback to 3.0)
             cvss_score = extract_cvss_score(cve.get('metrics', {}))
             
+            # Extract vendor name from CPE configurations
+            vendor_name = extract_vendor_from_cve(cve, vendor_lookup)
+            
             vulnerability_record = {
                 'cve_id': cve_id,
                 'description': description,
                 'published_date': published,
                 'last_modified_date': last_modified,
                 'cvss_score': cvss_score,
+                'vendor_name': vendor_name,
                 'updated_at': datetime.utcnow().isoformat()
             }
             
@@ -325,6 +335,119 @@ def process_nvd_response(vulnerabilities_data: List[Dict]) -> List[Dict]:
             continue
     
     return processed_vulnerabilities
+
+
+def build_vendor_lookup(cpe_data: List[Dict]) -> Dict[str, str]:
+    """
+    Build a lookup dictionary mapping CPE names to vendor names.
+    
+    Args:
+        cpe_data: List of CPE records from NVD API
+        
+    Returns:
+        Dict[str, str]: Dictionary mapping CPE names to vendor names
+    """
+    vendor_lookup = {}
+    
+    if not cpe_data:
+        return vendor_lookup
+    
+    for cpe_record in cpe_data:
+        try:
+            cpe_info = cpe_record.get('cpe', {})
+            cpe_name = cpe_info.get('cpeName', '')
+            
+            if cpe_name:
+                # Parse CPE name to extract vendor
+                # CPE format: cpe:2.3:part:vendor:product:version:update:edition:language:sw_edition:target_sw:target_hw:other
+                vendor_name = extract_vendor_from_cpe_name(cpe_name)
+                if vendor_name:
+                    vendor_lookup[cpe_name] = vendor_name
+                    
+        except Exception as e:
+            logger.warning(f"Error processing CPE record: {str(e)}")
+            continue
+    
+    logger.info(f"Built vendor lookup with {len(vendor_lookup)} CPE entries")
+    return vendor_lookup
+
+
+def extract_vendor_from_cpe_name(cpe_name: str) -> Optional[str]:
+    """
+    Extract vendor name from CPE name string.
+    
+    Args:
+        cpe_name: CPE name in format cpe:2.3:part:vendor:product:...
+        
+    Returns:
+        Optional[str]: Vendor name or None if not extractable
+    """
+    try:
+        # Split CPE name by colons
+        parts = cpe_name.split(':')
+        
+        # CPE 2.3 format has vendor at index 3
+        if len(parts) >= 4 and parts[0] == 'cpe' and parts[1] == '2.3':
+            vendor = parts[3]
+            
+            # Clean up vendor name (remove URL encoding, etc.)
+            if vendor and vendor != '*':
+                # Replace common URL encodings
+                vendor = vendor.replace('%20', ' ')
+                vendor = vendor.replace('_', ' ')
+                
+                # Capitalize first letter of each word
+                vendor = ' '.join(word.capitalize() for word in vendor.split())
+                
+                return vendor
+                
+    except Exception as e:
+        logger.warning(f"Error parsing CPE name {cpe_name}: {str(e)}")
+    
+    return None
+
+
+def extract_vendor_from_cve(cve_data: Dict, vendor_lookup: Dict[str, str]) -> Optional[str]:
+    """
+    Extract vendor name from CVE data using CPE configurations.
+    
+    Args:
+        cve_data: CVE data from NVD API
+        vendor_lookup: Dictionary mapping CPE names to vendor names
+        
+    Returns:
+        Optional[str]: Vendor name or None if not found
+    """
+    try:
+        # Look for CPE configurations in the CVE data
+        configurations = cve_data.get('configurations', [])
+        
+        for config in configurations:
+            # Check nodes in configuration
+            nodes = config.get('nodes', [])
+            
+            for node in nodes:
+                # Check CPE matches
+                cpe_matches = node.get('cpeMatch', [])
+                
+                for cpe_match in cpe_matches:
+                    cpe_name = cpe_match.get('criteria', '')
+                    
+                    # First try exact match in vendor lookup
+                    if cpe_name in vendor_lookup:
+                        return vendor_lookup[cpe_name]
+                    
+                    # If no exact match, try to extract vendor directly from CPE name
+                    vendor = extract_vendor_from_cpe_name(cpe_name)
+                    if vendor:
+                        return vendor
+        
+        # If no vendor found in configurations, return None
+        return None
+        
+    except Exception as e:
+        logger.warning(f"Error extracting vendor from CVE: {str(e)}")
+        return None
 
 
 def extract_cvss_score(metrics: Dict) -> Optional[float]:

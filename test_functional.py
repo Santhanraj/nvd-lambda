@@ -456,6 +456,94 @@ class TestCPEFunctionalScenarios(unittest.TestCase):
         response_body = json.loads(result['body'])
         self.assertIn('processed_count', response_body)
         self.assertEqual(response_body['processed_count'], 1)  # 1 vulnerability processed
+    
+    @requests_mock.Mocker()
+    @patch('lambda_function.create_client')
+    @patch('lambda_function.time.sleep')
+    def test_vendor_lookup_integration(self, mock_sleep, mock_create_client, m):
+        """Test vendor lookup integration with CVE and CPE data."""
+        # Mock Supabase client
+        mock_client = Mock()
+        mock_table = Mock()
+        mock_upsert = Mock()
+        mock_execute = Mock()
+        
+        mock_client.table.return_value = mock_table
+        mock_table.upsert.return_value = mock_upsert
+        mock_upsert.execute.return_value = Mock()
+        mock_create_client.return_value = mock_client
+        
+        # Mock CVE API response with CPE configurations
+        cve_response = {
+            'totalResults': 1,
+            'vulnerabilities': [{
+                'cve': {
+                    'id': 'CVE-2023-12345',
+                    'descriptions': [{
+                        'lang': 'en',
+                        'value': 'Apache HTTP Server vulnerability'
+                    }],
+                    'published': '2023-01-01T00:00:00.000',
+                    'lastModified': '2023-01-02T00:00:00.000',
+                    'configurations': [{
+                        'nodes': [{
+                            'cpeMatch': [{
+                                'criteria': 'cpe:2.3:a:apache:http_server:2.4.41:*:*:*:*:*:*:*'
+                            }]
+                        }]
+                    }],
+                    'metrics': {
+                        'cvssMetricV31': [{
+                            'cvssData': {
+                                'baseScore': 7.5
+                            }
+                        }]
+                    }
+                }
+            }]
+        }
+        
+        # Mock CPE API response
+        cpe_response = {
+            'totalResults': 1,
+            'products': [{
+                'cpe': {
+                    'cpeName': 'cpe:2.3:a:apache:http_server:2.4.41:*:*:*:*:*:*:*',
+                    'cpeNameId': 'apache-http-server-id',
+                    'lastModified': '2023-01-01T00:00:00.000'
+                }
+            }]
+        }
+        
+        # Register mock responses
+        m.get(lambda_function.NVD_BASE_URL, json=cve_response, status_code=200)
+        m.get(lambda_function.CPE_BASE_URL, json=cpe_response, status_code=200)
+        
+        # Test the integration
+        start_date = datetime.utcnow() - timedelta(days=1)
+        end_date = datetime.utcnow()
+        
+        # Fetch both CVE and CPE data
+        vulnerabilities = lambda_function.fetch_nvd_vulnerabilities(start_date, end_date, 'test-key')
+        cpe_data = lambda_function.fetch_nvd_cpe_data(start_date, end_date, 'test-key')
+        
+        # Process vulnerabilities with vendor lookup
+        processed_vulnerabilities = lambda_function.process_nvd_response(vulnerabilities, cpe_data)
+        
+        # Verify vendor was extracted
+        self.assertEqual(len(processed_vulnerabilities), 1)
+        vuln = processed_vulnerabilities[0]
+        self.assertEqual(vuln['cve_id'], 'CVE-2023-12345')
+        self.assertEqual(vuln['vendor_name'], 'Apache')
+        
+        # Verify upsert includes vendor name
+        processed_count = lambda_function.upsert_to_supabase(mock_client, processed_vulnerabilities)
+        self.assertEqual(processed_count, 1)
+        
+        # Check that upsert was called with vendor_name
+        mock_table.upsert.assert_called_once()
+        upserted_data = mock_table.upsert.call_args[0][0]
+        self.assertEqual(upserted_data[0]['vendor_name'], 'Apache')
 
 
 if __name__ == '__main__':

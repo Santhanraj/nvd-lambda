@@ -108,6 +108,13 @@ class TestNVDLambdaFunction(unittest.TestCase):
                 }],
                 'published': '2023-01-01T00:00:00.000',
                 'lastModified': '2023-01-02T00:00:00.000',
+                'configurations': [{
+                    'nodes': [{
+                        'cpeMatch': [{
+                            'criteria': 'cpe:2.3:a:apache:http_server:2.4.41:*:*:*:*:*:*:*'
+                        }]
+                    }]
+                }],
                 'metrics': {
                     'cvssMetricV31': [{
                         'cvssData': {
@@ -118,13 +125,99 @@ class TestNVDLambdaFunction(unittest.TestCase):
             }
         }]
         
-        processed = lambda_function.process_nvd_response(mock_data)
+        # Mock CPE data
+        mock_cpe_data = [{
+            'cpe': {
+                'cpeName': 'cpe:2.3:a:apache:http_server:2.4.41:*:*:*:*:*:*:*'
+            }
+        }]
+        
+        processed = lambda_function.process_nvd_response(mock_data, mock_cpe_data)
         
         self.assertEqual(len(processed), 1)
         vuln = processed[0]
         self.assertEqual(vuln['cve_id'], 'CVE-2023-12345')
         self.assertEqual(vuln['description'], 'Test vulnerability description')
         self.assertEqual(vuln['cvss_score'], 8.5)
+        self.assertEqual(vuln['vendor_name'], 'Apache')
+    
+    def test_extract_vendor_from_cpe_name(self):
+        """Test vendor extraction from CPE name."""
+        test_cases = [
+            ('cpe:2.3:a:apache:http_server:2.4.41:*:*:*:*:*:*:*', 'Apache'),
+            ('cpe:2.3:a:microsoft:windows:10:*:*:*:*:*:*:*', 'Microsoft'),
+            ('cpe:2.3:a:oracle:database:19c:*:*:*:*:*:*:*', 'Oracle'),
+            ('cpe:2.3:a:red_hat:enterprise_linux:8:*:*:*:*:*:*:*', 'Red Hat'),
+            ('cpe:2.3:a:*:product:1.0:*:*:*:*:*:*:*', None),  # Wildcard vendor
+            ('invalid:cpe:format', None),  # Invalid format
+        ]
+        
+        for cpe_name, expected_vendor in test_cases:
+            with self.subTest(cpe_name=cpe_name):
+                result = lambda_function.extract_vendor_from_cpe_name(cpe_name)
+                self.assertEqual(result, expected_vendor)
+    
+    def test_build_vendor_lookup(self):
+        """Test building vendor lookup dictionary from CPE data."""
+        mock_cpe_data = [
+            {
+                'cpe': {
+                    'cpeName': 'cpe:2.3:a:apache:http_server:2.4.41:*:*:*:*:*:*:*'
+                }
+            },
+            {
+                'cpe': {
+                    'cpeName': 'cpe:2.3:a:microsoft:windows:10:*:*:*:*:*:*:*'
+                }
+            },
+            {
+                'cpe': {
+                    'cpeName': 'invalid:format'  # Should be skipped
+                }
+            }
+        ]
+        
+        vendor_lookup = lambda_function.build_vendor_lookup(mock_cpe_data)
+        
+        self.assertEqual(len(vendor_lookup), 2)
+        self.assertEqual(vendor_lookup['cpe:2.3:a:apache:http_server:2.4.41:*:*:*:*:*:*:*'], 'Apache')
+        self.assertEqual(vendor_lookup['cpe:2.3:a:microsoft:windows:10:*:*:*:*:*:*:*'], 'Microsoft')
+    
+    def test_extract_vendor_from_cve(self):
+        """Test vendor extraction from CVE data."""
+        mock_cve_data = {
+            'configurations': [{
+                'nodes': [{
+                    'cpeMatch': [{
+                        'criteria': 'cpe:2.3:a:apache:http_server:2.4.41:*:*:*:*:*:*:*'
+                    }]
+                }]
+            }]
+        }
+        
+        vendor_lookup = {
+            'cpe:2.3:a:apache:http_server:2.4.41:*:*:*:*:*:*:*': 'Apache'
+        }
+        
+        vendor = lambda_function.extract_vendor_from_cve(mock_cve_data, vendor_lookup)
+        self.assertEqual(vendor, 'Apache')
+    
+    def test_extract_vendor_from_cve_no_match(self):
+        """Test vendor extraction when no match found."""
+        mock_cve_data = {
+            'configurations': [{
+                'nodes': [{
+                    'cpeMatch': [{
+                        'criteria': 'cpe:2.3:a:unknown:product:1.0:*:*:*:*:*:*:*'
+                    }]
+                }]
+            }]
+        }
+        
+        vendor_lookup = {}
+        
+        vendor = lambda_function.extract_vendor_from_cve(mock_cve_data, vendor_lookup)
+        self.assertEqual(vendor, 'Unknown')  # Should extract from CPE name directly
     
     @patch('lambda_function.create_client')
     def test_initialize_supabase_client_success(self, mock_create_client):
